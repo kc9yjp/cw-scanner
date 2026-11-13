@@ -11,7 +11,9 @@ logging) that a general scanner doesn't bother with.
 - **`scan`** — sweeps a band segment and lists the frequencies where
   signals rise above the local noise floor. Detection is deliberately
   simple: averaged FFT, rolling-median noise floor (the same idea as
-  MultiScan's "pseudo-spectrum"), peaks more than 10 dB above the floor.
+  MultiScan's "pseudo-spectrum"), peaks more than 5 dB above the floor.
+  Each step averages 1 s of samples and skips the dongle's DC spike at the
+  tuned frequency, so weak signals show up without false alarms.
 - **`listen`** — tunes to one frequency, saves what it hears as a WAV file
   (700 Hz audio tone), and prints a live Morse decode of it.
 
@@ -46,6 +48,9 @@ python3 cwscan.py scan
 # Sweep a different segment, e.g. the 20 m CW segment
 python3 cwscan.py scan --start 14.0M --stop 14.07M
 
+# Dig for very weak signals: average longer and lower the threshold
+python3 cwscan.py scan --dwell 3 --threshold 3
+
 # Listen to one frequency for 30 seconds, save audio + decode it
 python3 cwscan.py listen 7030000 --duration 30
 
@@ -69,7 +74,12 @@ directly. How you get there depends on the dongle:
   python3 cwscan.py scan --direct-sampling q
   python3 cwscan.py listen 7030000 --direct-sampling q
   ```
-- Above ~30 MHz (2 m, 70 cm) neither flag is needed on either dongle.
+- **Generic dongles** (EEPROM says `Realtek` / `RTL2838UHIDIR`; check with
+  `rtl_eeprom`) — can't receive HF at all. The R820T tuner stops at about
+  24 MHz (below that you get `[R82XX] PLL not locked!`), and
+  `--direct-sampling` runs but has no antenna path wired to it, so you
+  just get noise. You need a V3, a V4, or an external upconverter.
+- Above ~30 MHz (2 m, 70 cm) neither flag is needed on any dongle.
 
 If the band sounds dead, check the antenna first: a random length of wire
 works far better on HF than the little telescopic whip that ships with
@@ -86,16 +96,17 @@ most dongles.
   python3 test_synth.py
   ```
 
-## Status: hardware testing still to be done
+## Status
 
-No RTL-SDR hardware is attached to the machine this was built on, so the
-DSP and decoding logic were verified with synthetic signals only — the
-self-test generates a known "CQ" in Morse, checks the detector finds it
-and the decoder reads it back (7 tests, all passing). The `scan` and
-`listen` paths against a real dongle are untested: the first real run is
-the moment of truth for tuner settling, gain, and whether the noise floor
-behaves. If the first scan is noisy or empty, try `--gain` with a manual
-value instead of `auto`, and `--threshold` to raise or lower sensitivity.
+The self-test covers detection (including weak signals and the DC spike),
+scan step planning, and decoding with synthetic signals (12 tests).
+
+On real hardware, `scan` and `listen` have been run on a generic R820T
+dongle at VHF: `scan` finds FM broadcast carriers and stays quiet on an
+empty 2 m CW segment, and `listen` records and decodes. A real CW signal
+has not been decoded off the air yet. If scans are noisy or empty, try
+`--gain` with a manual value instead of `auto`, `--threshold` to raise or
+lower sensitivity, and `--dwell` to average longer.
 
 ## What's next
 

@@ -15,10 +15,16 @@ How scanning works
 ------------------
 An RTL-SDR dongle can only see a slice of spectrum at a time (here 250 kHz
 by default, sampled at 250 kS/s). So `scan` hops across the requested range
-in overlapping chunks. For each chunk it:
+in steps. The dongle always shows a spike at the exact frequency it is tuned
+to (its "DC spike"), and the edges of each slice are rolled off by its
+filters, so each step only uses the clean part just above the centre:
+centre + DC_GUARD_HZ up to EDGE_FRACTION of the sample rate. The next step
+starts where that one ended, so there are no gaps and no overlaps. For each
+step it:
 
-1. Captures IQ samples and averages several FFTs into one power spectrum.
-   Averaging knocks the noise down while real signals stay put.
+1. Captures --dwell seconds of IQ and averages many FFTs into one power
+   spectrum. Averaging knocks the noise down while real signals stay put,
+   which is what lets weak signals stand out.
 2. Estimates the noise floor with a rolling median across the spectrum.
    A median is blind to the narrow spikes that signals make, so it tracks
    the noise even when signals are present. This is the same idea as
@@ -29,8 +35,9 @@ in overlapping chunks. For each chunk it:
 
 How listening works
 -------------------
-The dongle is tuned to the requested frequency, so the CW signal sits near
-0 Hz in the baseband. The signal is:
+The dongle is tuned LISTEN_OFFSET_HZ below the requested frequency, which
+keeps its DC spike away from the signal, and the samples are then shifted
+digitally so the CW signal sits at 0 Hz in the baseband. The signal is:
 
 1. Low-pass filtered to --cutoff Hz (default 400 Hz). This is the narrow
    CW filter: it keeps the one signal and throws away everything else in
@@ -64,10 +71,21 @@ DEFAULT_SAMPLE_RATE = 250_000   # Hz. Narrow on purpose: at 250 kS/s a 4096
                                 # point FFT gives ~61 Hz bins, fine for CW
                                 # signals that are only 100-500 Hz wide.
 DEFAULT_FFT_SIZE = 4096
-HOP_OVERLAP = 0.2               # neighbouring chunks overlap by 20% so a
-                                # signal on a chunk edge is still caught.
-DEFAULT_THRESHOLD_DB = 10.0     # how far above the local floor a signal
-                                # must rise to be reported.
+DC_GUARD_HZ = 3000.0            # ignore this much above the tuned centre,
+                                # where the dongle's DC spike sits.
+EDGE_FRACTION = 0.45            # use up to 0.45 x sample rate above centre;
+                                # beyond that the dongle's filters roll off.
+DEFAULT_DWELL_S = 1.0           # seconds of IQ averaged per scan step. At
+                                # 250 kS/s that's ~60 FFTs, which steadies
+                                # the noise enough that --threshold can go
+                                # down to ~3 dB without false alarms.
+READ_BLOCK = 262144             # samples per dongle read (~1 s at 250 kS/s);
+                                # must be a multiple of 256 for libusb.
+DEFAULT_THRESHOLD_DB = 5.0      # how far above the local floor a signal
+                                # must rise to be reported. Low on purpose:
+                                # weak CW often sits only 4-6 dB up.
+MERGE_HZ = 300.0                # hits closer than this are one signal.
+LISTEN_OFFSET_HZ = 10_000.0     # listen tunes this far below the signal.
 DEFAULT_CUTOFF_HZ = 400.0       # width of the narrow CW filter.
 DEFAULT_TONE_HZ = 700.0         # pitch of the audio tone in listen mode.
 AUDIO_RATE = 8000               # Hz, sample rate of the saved WAV file.
@@ -167,6 +185,47 @@ def detect_signals(iq, sample_rate, fft_size=DEFAULT_FFT_SIZE,
     """Full detection chain for one chunk of IQ: spectrum -> candidates."""
     freqs, psd = averaged_psd(iq, sample_rate, fft_size)
     return find_candidates(freqs, psd, threshold_db)
+
+
+def usable_band(sample_rate):
+    """(low, high) offsets from the tuned centre that a scan step trusts.
+
+    Only the side above the centre is used: it starts DC_GUARD_HZ up, clear
+    of the DC spike, and stops before the band edge roll-off.
+    """
+    return DC_GUARD_HZ, EDGE_FRACTION * sample_rate
+
+
+def scan_steps(start, stop, sample_rate):
+    """Tuner centre frequencies that cover start..stop with no gaps.
+
+    Each step covers centre + low .. centre + high (see usable_band), and
+    the next step starts exactly where the last one ended.
+    """
+    low, high = usable_band(sample_rate)
+    centres = []
+    centre = start - low
+    while centre + low < stop:
+        centres.append(centre)
+        centre += high - low
+    return centres
+
+
+def merge_hits(hits, merge_hz=MERGE_HZ):
+    """Collapse (freq, snr) hits closer than merge_hz, keeping the strongest.
+
+    A signal right on a step boundary can be seen by both steps.
+    Returns the merged hits, strongest first.
+    """
+    merged = []
+    for freq, snr in sorted(hits):
+        if merged and freq - merged[-1][0] < merge_hz:
+            if snr > merged[-1][1]:
+                merged[-1] = (freq, snr)
+        else:
+            merged.append((freq, snr))
+    merged.sort(key=lambda item: item[1], reverse=True)
+    return merged
 
 
 def demodulate_cw(iq, sample_rate, tone_hz=DEFAULT_TONE_HZ,
@@ -283,34 +342,50 @@ def open_sdr(args):
 # Modes
 # --------------------------------------------------------------------------
 
+def read_iq(sdr, n_samples):
+    """Read n_samples of IQ, in READ_BLOCK pieces so long dwells work."""
+    blocks = []
+    remaining = n_samples
+    while remaining > 0:
+        n = min(READ_BLOCK, remaining)
+        blocks.append(sdr.read_samples(n))
+        remaining -= n
+    return np.concatenate(blocks)
+
+
 def cmd_scan(args):
     start = parse_freq(args.start)
     stop = parse_freq(args.stop)
     if stop <= start:
         raise SystemExit("--stop must be above --start.")
+    low, high = usable_band(args.sample_rate)
+    centres = scan_steps(start, stop, args.sample_rate)
+    # Whole FFTs only, and at least one.
+    n_samples = max(args.fft_size, int(args.dwell * args.sample_rate)
+                    // args.fft_size * args.fft_size)
     sdr = open_sdr(args)
-    hop = args.sample_rate * (1.0 - HOP_OVERLAP)
-    print("Scanning %s to %s in %s chunks at %d S/s ..."
-          % (fmt_freq(start), fmt_freq(stop), fmt_freq(hop),
-             args.sample_rate))
+    print("Scanning %s to %s in %d step(s) of %s, %.1f s each ..."
+          % (fmt_freq(start), fmt_freq(stop), len(centres),
+             fmt_freq(high - low), args.dwell))
     found = []
     try:
-        centre = start + args.sample_rate / 2.0
-        while centre - args.sample_rate / 2.0 < stop:
+        for centre in centres:
             sdr.center_freq = centre
             time.sleep(0.1)  # let the tuner and AGC settle
-            iq = sdr.read_samples(65536)
+            sdr.read_samples(16384)  # discard samples from mid-retune
+            iq = read_iq(sdr, n_samples)
             for cand in detect_signals(iq, args.sample_rate,
                                        args.fft_size, args.threshold):
+                if not low <= cand["freq_hz"] < high:
+                    continue  # DC spike or band edge
                 absolute = centre + cand["freq_hz"]
                 if start <= absolute <= stop:
                     found.append((absolute, cand["snr_db"]))
                     print("  %s  +%5.1f dB above floor"
                           % (fmt_freq(absolute), cand["snr_db"]))
-            centre += hop
     finally:
         sdr.close()
-    found.sort(key=lambda item: item[1], reverse=True)
+    found = merge_hits(found)
     print()
     if found:
         print("%d signal(s) found, strongest first:" % len(found))
@@ -324,8 +399,11 @@ def cmd_scan(args):
 def cmd_listen(args):
     freq = parse_freq(args.freq)
     sdr = open_sdr(args)
-    sdr.center_freq = freq
+    # Tune below the signal so the DC spike isn't on top of it; each block
+    # read is shifted back down by the same amount below.
+    sdr.center_freq = freq - LISTEN_OFFSET_HZ
     time.sleep(0.2)  # let the tuner and AGC settle
+    sdr.read_samples(16384)  # discard samples from mid-retune
     out_path = args.output or ("cw-%.0f.wav" % freq)
     print("Listening on %s for %.0f s (tone %d Hz, filter %d Hz) ..."
           % (fmt_freq(freq), args.duration, args.tone, args.cutoff))
@@ -333,10 +411,18 @@ def cmd_listen(args):
     chunks = []
     text = ""
     try:
-        chunk_samples = int(args.sample_rate)  # 1 second per chunk
+        # ~1 second per chunk. USB reads must be a multiple of 512 bytes
+        # (256 IQ samples), which READ_BLOCK is and a plain 250000 isn't.
+        chunk_samples = READ_BLOCK
+        n_read = 0
         deadline = time.time() + args.duration
         while time.time() < deadline:
-            chunks.append(sdr.read_samples(chunk_samples))
+            chunk = sdr.read_samples(chunk_samples)
+            # Running sample index keeps the shift's phase continuous
+            # from one chunk to the next.
+            t = (n_read + np.arange(len(chunk))) / args.sample_rate
+            chunks.append(chunk * np.exp(-2j * np.pi * LISTEN_OFFSET_HZ * t))
+            n_read += len(chunk)
             joined = np.concatenate(chunks)
             audio, env, audio_rate = demodulate_cw(
                 joined, args.sample_rate,
@@ -393,6 +479,10 @@ def build_parser():
                              "(default %(default)s)")
     p_scan.add_argument("--fft-size", type=int, default=DEFAULT_FFT_SIZE,
                         help="FFT size (default %(default)s)")
+    p_scan.add_argument("--dwell", type=float, default=DEFAULT_DWELL_S,
+                        help="seconds averaged per step; longer finds "
+                             "weaker signals but sweeps slower "
+                             "(default %(default)s)")
     add_common(p_scan)
     p_scan.set_defaults(func=cmd_scan)
 
