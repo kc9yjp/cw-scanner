@@ -15,6 +15,17 @@ logging) that a general scanner doesn't bother with.
 - **`listen`** — tunes to one frequency, saves what it hears as a WAV file
   (700 Hz audio tone), and prints a live Morse decode of it.
 
+## Install (Arch)
+
+```sh
+./install-arch.sh
+source .venv/bin/activate
+```
+
+This installs `rtl-sdr`, numpy and scipy with pacman, puts pyrtlsdr in a
+`.venv` virtualenv (it isn't in the official repos), checks the dongle
+setup and runs the self-test. It's safe to run again.
+
 ## Install (Debian / Ubuntu)
 
 ```sh
