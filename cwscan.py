@@ -152,13 +152,16 @@ def noise_floor_db(psd_db, median_size=151):
     return ndimage.median_filter(psd_db, size=size, mode="nearest")
 
 
-def find_candidates(freqs_hz, psd_db, threshold_db=DEFAULT_THRESHOLD_DB):
+def find_candidates(freqs_hz, psd_db, threshold_db=DEFAULT_THRESHOLD_DB,
+                    floor=None):
     """Group bins that rise above the local noise floor into candidates.
 
-    Returns a list of dicts: relative frequency, peak level, and strength
-    above the local floor, strongest first.
+    `floor` is the noise floor in dB per bin; if omitted it is estimated
+    with noise_floor_db(). Returns a list of dicts: relative frequency,
+    peak level, and strength above the local floor, strongest first.
     """
-    floor = noise_floor_db(psd_db)
+    if floor is None:
+        floor = noise_floor_db(psd_db)
     above = (psd_db - floor) > threshold_db
     candidates = []
     i, n = 0, len(above)

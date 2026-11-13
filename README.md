@@ -16,6 +16,10 @@ logging) that a general scanner doesn't bother with.
   tuned frequency, so weak signals show up without false alarms.
 - **`listen`** — tunes to one frequency, saves what it hears as a WAV file
   (700 Hz audio tone), and prints a live Morse decode of it.
+- **`hamscan.py`** — sweeps the US amateur bands (2200 m to 1 mm, as far
+  as the dongle reaches) and lists each signal with its band, frequency,
+  strength, width, likely mode, and the lowest license class (Technician,
+  General or Extra) allowed to transmit that mode there.
 
 ## Install (Arch)
 
@@ -60,6 +64,63 @@ python3 cwscan.py listen 7.03M --duration 30 --wpm 20 --output cq.wav
 
 Frequencies accept plain Hz (`7030000`), `k`/`kHz`, or `M`/`MHz`.
 
+### Ham band scanner
+
+```sh
+# Every band, what this dongle can reach, and the lowest license class
+python3 hamscan.py --list-bands
+
+# Sweep every band the dongle can reach (about 4 minutes for 12 m-23 cm)
+python3 hamscan.py
+
+# Just some bands
+python3 hamscan.py --bands 10m,6m,2m
+
+# HF too, on an RTL-SDR Blog V3
+python3 hamscan.py --direct-sampling q
+```
+
+Example output:
+
+```
+Band   Frequency       Strength  Width     Likely mode                        License
+10m    28.7898 MHz     +11.9 dB  3.0 kHz   SSB                                General
+2m     146.9984 MHz     +5.7 dB  62 Hz     FM carrier (no audio)              Technician
+```
+
+**License** is the lowest class allowed to transmit that mode on that
+frequency (FCC Part 97.301), so it accounts for the Technician CW-only
+slices on 80, 40 and 15 m. Only the classes issued today are used, so
+the segments grandfathered Advanced licensees share with Extra (such as
+7.125-7.175 MHz) show as Extra.
+
+**Likely mode** is a guess from the measured width and the ARRL band plan
+(plus the FT8/FT4/WSPR frequencies): narrow is CW or a carrier, ~3-4 kHz
+is SSB or data, ~12-14 kHz is FM. An idle FM carrier looks just like CW.
+
+**Spurs ("birdies").** A dongle hears its own clocks, and on UHF most of
+the hits can be birdies. Harmonics of 14.4 MHz (which land on 144.000,
+432.000 and 1296.000 MHz) are always hidden. For the rest, disconnect the
+antenna once and run:
+
+```sh
+python3 hamscan.py --calibrate
+```
+
+That saves every hit to `birdies.txt`, and later scans hide them (and say
+how many). `--show-spurs` lists them, marked. Recalibrate if you change
+dongle, computer or USB port.
+
+**Coverage.** The band list is every US amateur band; what's scanned
+depends on the dongle. `hamscan.py` reads the tuner chip at startup
+(E4000, FC0012, FC0013, FC2580, R820T or R828D), scans the part of each
+band that chip can tune, and lists the bands it couldn't reach. HF below
+the tuner is added with `--direct-sampling` (RTL-SDR Blog V3) or
+automatically on an R828D (V4); see the HF notes below. Microwave bands
+(13 cm and up) are beyond any RTL-SDR without a downconverter. 9 cm
+(3.3-3.5 GHz) is left out because the FCC voted in 2020 to remove that
+allocation.
+
 ## HF notes — read this before wondering why 40 m is silent
 
 Most CW lives on HF, 1.8-30 MHz, and the dongle's tuner doesn't cover HF
@@ -91,9 +152,14 @@ most dongles.
   numpy/scipy; only the dongle code needs pyrtlsdr.
 - `morse.py` — Morse encoder and a simple mark/space timing decoder.
   Hardware-independent, so it can be tested on its own.
-- `test_synth.py` — self-test with synthetic signals. Run it any time:
+- `hamscan.py` — the all-bands scanner. Reuses `cwscan.py`'s detector.
+- `bandplan.py` — US band edges, license privileges, band-plan usage and
+  digital-mode frequencies, with the lookups `hamscan.py` uses.
+- `test_synth.py`, `test_hamscan.py` — self-tests with synthetic signals.
+  Run them any time:
   ```sh
   python3 test_synth.py
+  python3 test_hamscan.py
   ```
 
 ## Status
@@ -107,6 +173,12 @@ empty 2 m CW segment, and `listen` records and decodes. A real CW signal
 has not been decoded off the air yet. If scans are noisy or empty, try
 `--gain` with a manual value instead of `auto`, `--threshold` to raise or
 lower sensitivity, and `--dwell` to average longer.
+
+`hamscan.py` has swept 12 m to 23 cm on the same dongle. Without a
+birdies file, most UHF hits were the dongle's own spurs (14.4 MHz
+harmonics and a 128 kHz comb), which is why `--calibrate` exists. Its
+mode guesses have been checked on synthetic CW, SSB and FM (8 tests), not
+yet against signals of known mode off the air.
 
 ## What's next
 
