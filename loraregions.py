@@ -14,7 +14,16 @@ picks it up with --region.
 
 from dataclasses import dataclass, field
 
-LORA_BANDWIDTHS = (125_000, 250_000, 500_000)   # Hz, the ones used in practice.
+LORA_BANDWIDTHS = (62_500, 125_000, 250_000, 500_000)  # Hz, used in practice.
+
+
+@dataclass(frozen=True)
+class Preset:
+    """A mesh network's default radio settings in a region."""
+    name: str                   # e.g. "Meshtastic LongFast"
+    freq_hz: float
+    bw_hz: float
+    sf: int
 
 
 @dataclass(frozen=True)
@@ -63,6 +72,7 @@ class Region:
     dwell_limit_s: float        # longest single transmission allowed for
     dwell_exempt_bw_hz: float   # signals narrower than this (None: no limit)
     plans: tuple = ()
+    presets: dict = field(default_factory=dict)  # key -> Preset
 
     def channels(self, freq_hz, bw_hz=None, tolerance_hz=None):
         """Labels of every channel the signal could be on, in plan order
@@ -130,6 +140,8 @@ def _meshtastic(bw_hz, low_hz, high_hz, named=None):
 #   channels of 500 kHz from 923.3 MHz every 600 kHz.
 # * Meshtastic: slots of the preset's bandwidth from 902.0 MHz. The
 #   default LongFast channel is slot 20 of the 250 kHz grid, 906.875 MHz.
+# * MeshCore: one channel. The US/Canada recommended preset (since
+#   October 2025, community-published) is 910.525 MHz, 62.5 kHz, SF7.
 # * Dwell: frequency-hopping systems narrower than 500 kHz may stay on
 #   one channel at most 400 ms at a time. 500 kHz signals count as
 #   digital modulation (6 dB width >= 500 kHz) and have no dwell limit.
@@ -154,7 +166,13 @@ US915 = Region(
         _meshtastic(250_000, _m(902), _m(928),
                     named={20: "LongFast default"}),
         _meshtastic(500_000, _m(902), _m(928)),
+        ChannelPlan("MeshCore", _m(910.525), 62_500, 1, 62_500,
+                    named={0: "US default"}),
     ),
+    presets={
+        "meshtastic": Preset("Meshtastic LongFast", _m(906.875), 250_000, 11),
+        "meshcore": Preset("MeshCore", _m(910.525), 62_500, 7),
+    },
 )
 
 REGIONS = {r.code: r for r in (US915,)}

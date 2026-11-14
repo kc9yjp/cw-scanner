@@ -11,6 +11,8 @@ Exits 0 when every test passes, 1 otherwise.
 """
 
 import argparse
+import contextlib
+import io
 import json
 import os
 import sys
@@ -91,7 +93,8 @@ def test_every_sf_and_bw():
     """SF7-12 at each bandwidth, at 0 dB: right SF, BW, direction, time
     and length."""
     cases = [(sf, 125_000) for sf in range(7, 13)] + [
-        (7, 250_000), (10, 250_000), (8, 500_000), (12, 500_000)]
+        (7, 62_500), (10, 62_500), (7, 250_000), (10, 250_000),
+        (8, 500_000), (12, 500_000)]
     for sf, bw in cases:
         iq = add(noise(2.0, seed=sf), packet(sf, bw, 250e3, seed=sf),
                  0.3, 0.0, bw)
@@ -178,8 +181,34 @@ def test_region_channels():
     assert US915.channels(923.3e6, 500_000) == ["LoRaWAN downlink 0"]
     assert US915.channels(906.875e6, 250_000) == \
         ["Meshtastic slot 20 (LongFast default)"]
+    assert US915.channels(910.525e6, 62_500) == ["MeshCore 0 (US default)"]
     assert US915.channels(904.4e6, 125_000) == [], "between channels"
     assert US915.channels(904.3e6, 250_000) == [], "wrong bandwidth"
+
+
+def test_mesh_flags():
+    """--meshtastic / --meshcore centre on the US defaults; they can't be
+    combined with each other or with --center."""
+    parser = lorascan.build_parser()
+    for flag, freq, bw, sf in (("--meshtastic", 906.875e6, 250_000, 11),
+                               ("--meshcore", 910.525e6, 62_500, 7)):
+        args = parser.parse_args([flag])
+        lorascan.apply_preset(args, parser)
+        assert float(args.center) == freq, args.center
+        assert (args.preset.bw_hz, args.preset.sf) == (bw, sf), args.preset
+    args = parser.parse_args([])
+    lorascan.apply_preset(args, parser)
+    assert args.center is None and args.preset is None
+    for bad in (["--meshcore", "--center", "904M"],
+                ["--meshcore", "--meshtastic"]):
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                args = parser.parse_args(bad)
+                lorascan.apply_preset(args, parser)
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("accepted %s" % bad)
 
 
 def test_dwell():
@@ -331,6 +360,7 @@ TESTS = [
     ("5-symbol chirp burst isn't a packet", test_too_short),
     ("neighbouring channels kept apart", test_side_by_side),
     ("US915 channel names", test_region_channels),
+    ("--meshtastic / --meshcore", test_mesh_flags),
     ("US915 dwell limit", test_dwell),
     ("sweep steps tile the band", test_sweep_tiling),
     ("gapless stream", test_stream_gapless),

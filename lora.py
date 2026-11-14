@@ -6,7 +6,7 @@ on saved recordings. lorascan.py does the tuning and printing.
 How LoRa looks
 --------------
 LoRa is chirp spread spectrum. Each symbol is a tone that sweeps across
-the whole channel bandwidth (BW: 125, 250 or 500 kHz) in 2**SF / BW
+the whole channel bandwidth (BW: 62.5, 125, 250 or 500 kHz) in 2**SF / BW
 seconds, where SF, the spreading factor, is 7 to 12. A packet starts
 with a preamble of identical up-chirps (8 for LoRaWAN, 16 for
 Meshtastic), then two sync symbols and 2.25 down-chirps, then the data.
@@ -44,7 +44,7 @@ from scipy import fft as sp_fft
 from scipy import ndimage
 from scipy.signal import resample_poly
 
-LORA_BANDWIDTHS = (125_000, 250_000, 500_000)
+LORA_BANDWIDTHS = (62_500, 125_000, 250_000, 500_000)
 SPREADING_FACTORS = tuple(range(7, 13))
 
 SAMPLE_RATE = 2_400_000         # the fastest an RTL-SDR runs without drops.
@@ -52,7 +52,7 @@ FRAME = 512                     # spectrogram frame: 4.7 kHz, 0.21 ms.
 COARSE = 4                      # detect on 4 x 4 averaged cells (19 kHz,
                                 # 0.85 ms); measure on the full grid.
 FLOOR_PERCENTILE = 25           # noise floor per bin, robust to busy channels.
-BOX_HZ = 125_000                # detect on power averaged over 125 kHz
+BOX_HZ = 62_500                 # detect on power averaged over 62.5 kHz
 BOX_S = 0.004                   # by 4 ms: catches any LoRa sweep speed.
 DEFAULT_THRESHOLD_DB = 1.5      # box average must reach this over noise ...
 GROW_DB = 0.6                   # ... and the burst is everything connected
@@ -61,7 +61,7 @@ MERGE_GAP_S = 0.030             # pieces of one weak packet closer than this
                                 # on the same channel are joined.
 BRIDGE_S = 0.005                # dips shorter than this don't end a burst.
 MIN_BURST_S = 0.002
-MIN_WIDTH_HZ = 60_000           # narrower than half of 125 kHz isn't LoRa.
+MIN_WIDTH_HZ = 40_000           # well under 62.5 kHz isn't LoRa.
 SPEC_SMOOTH_BINS = 5            # ~23 kHz smoothing when measuring width.
 ON_SMOOTH_FRAMES = 9            # ~2 ms smoothing when timing a burst.
 GAP_HZ = 25_000                 # spectrum dips narrower than this are bridged.
@@ -217,16 +217,24 @@ def find_bursts(iq, sample_rate=SAMPLE_RATE, threshold_db=DEFAULT_THRESHOLD_DB):
     return _merge(bursts, MERGE_GAP_S * sample_rate, snr, freqs, n_frames)
 
 
+def _overlap(a, b):
+    """Hz of spectrum two bursts share."""
+    lo = max(a["freq_hz"] - a["width_hz"] / 2, b["freq_hz"] - b["width_hz"] / 2)
+    hi = min(a["freq_hz"] + a["width_hz"] / 2, b["freq_hz"] + b["width_hz"] / 2)
+    return max(0.0, hi - lo)
+
+
 def _merge(bursts, gap_samples, snr, freqs, n_frames):
-    """Join bursts on the same channel that overlap or nearly touch in
-    time (a weak packet can break up), keeping the wider frequency span
+    """Join bursts on the same channel (the narrower mostly inside the
+    wider) that overlap or nearly touch in time (a weak packet, or a
+    packet's tail, can break off), keeping the wider frequency span
     and re-measuring SNR over the union."""
     bursts.sort(key=lambda b: (b["start"], b["freq_hz"]))
     out = []
     for burst in bursts:
         for prev in out:
-            same_channel = (abs(prev["freq_hz"] - burst["freq_hz"])
-                            < max(prev["width_hz"], burst["width_hz"]) / 4)
+            same_channel = _overlap(prev, burst) >= 0.75 * min(
+                prev["width_hz"], burst["width_hz"])
             if same_channel and burst["start"] - prev["stop"] < gap_samples:
                 if burst["width_hz"] > prev["width_hz"]:
                     for key in ("freq_hz", "width_hz", "bw_hz"):

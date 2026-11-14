@@ -141,8 +141,10 @@ python3 lorascan.py --passes 0
 # Watch LoRaWAN sub-band 2 (Helium, TTN) without gaps
 python3 lorascan.py --center 904.6M
 
-# Watch Meshtastic's default LongFast channel for 10 minutes
-python3 lorascan.py --center 906.875M --duration 600
+# Watch the US default channel of Meshtastic (LongFast, 906.875 MHz)
+# or MeshCore (910.525 MHz), here for 10 minutes
+python3 lorascan.py --meshtastic --duration 600
+python3 lorascan.py --meshcore --duration 600
 
 # Save each packet's samples for decoding later
 python3 lorascan.py --center 904.6M --save-iq captures/
@@ -156,7 +158,7 @@ Time UTC    Frequency     BW       SF    Chirps    Airtime   Symbols       SNR  
 14:02:15.0  923.2984 MHz  500 kHz  SF8   down/inv  21 ms     42        +2.9 dB  n/a        LoRaWAN downlink 0
 ```
 
-- **BW / SF** — the occupied bandwidth (125, 250 or 500 kHz) is measured
+- **BW / SF** — the occupied bandwidth (62.5, 125, 250 or 500 kHz) is measured
   off the spectrum. The spreading factor (SF7-12) is found by
   "dechirping" the preamble at each SF and keeping the one that turns
   into a clean tone.
@@ -186,6 +188,19 @@ without gaps, which is better once you know where to look.
 about 0 dB at SF7 (which has the least spreading gain). LoRa itself
 works down to -20 dB, so a LoRa radio can decode distant transmitters
 that this scanner misses.
+
+**Mesh defaults.** `--meshtastic` and `--meshcore` are shortcuts for
+`--center` on each network's default US channel: Meshtastic LongFast is
+906.875 MHz, 250 kHz, SF11; MeshCore's recommended US/Canada preset
+(since October 2025) is 910.525 MHz, 62.5 kHz, SF7. `--list-channels`
+shows them. Each region keeps its own defaults in `loraregions.py`.
+
+**Frequency correction.** Channel names allow only ~8-25 kHz of error,
+and a dongle without a TCXO can be off by more. The test R820T read
+906.875 MHz Meshtastic packets as 906.826 MHz, 49 kHz low, until it was
+run with `--ppm 54`. If a strong packet shows no channel name, find your
+dongle's ppm the same way: watch a known channel and adjust `--ppm` until
+it lands.
 
 **Other countries.** Each region's rules (band, dwell limit, power, channel
 plans) are data in `loraregions.py`. Only `US915` is filled in. To add
@@ -261,12 +276,15 @@ yet against signals of known mode off the air.
 `lorascan.py` is checked on synthetic packets (every SF at 125 kHz, plus
 250 and 500 kHz, inverted I/Q, -4 dB SNR, two channels at once, and FSK
 and too-short chirp bursts that must not count) and on a fake dongle for
-the sweep and the gapless watch stream (16 tests). On the R820T dongle it
-has swept the whole band and watched sub-band 2 and the Meshtastic
-LongFast window. A first version called a few short FSK bursts LoRa; the
+the sweep and the gapless watch stream (17 tests). On the R820T dongle it
+has swept the whole band and watched sub-band 2, the Meshtastic LongFast
+channel and the MeshCore channel. A first version called a few short FSK bursts LoRa; the
 chirp threshold was set from ~70 real off-air bursts (the highest scored
 ~9 dB, LoRa scores 14+), and bursts shorter than 10 symbols no longer
-count. No confirmed LoRa packet has been heard off the air yet.
+count. With `--meshtastic --ppm 54` it heard real Meshtastic LongFast
+packets (SF11, 250 kHz, about 600 ms, +40 dB from a nearby node) and
+named the channel correctly. Nothing was heard on the MeshCore channel
+during the test.
 
 ## What's next
 

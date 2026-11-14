@@ -4,6 +4,8 @@
     python3 lorascan.py                    # sweep the whole US 902-928 MHz band
     python3 lorascan.py --passes 0         # ... over and over until Ctrl-C
     python3 lorascan.py --center 904.6M    # watch one ~1.9 MHz window
+    python3 lorascan.py --meshtastic       # watch Meshtastic's US default
+    python3 lorascan.py --meshcore         # watch MeshCore's US default
     python3 lorascan.py --list-channels    # the region's rules and channels
 
 For each transmission it prints: time (UTC), centre frequency, bandwidth,
@@ -104,7 +106,7 @@ def fmt_time(t):
 
 def fmt_row(f):
     if f["bw_hz"]:
-        bw = "%d kHz" % (f["bw_hz"] / 1e3)
+        bw = "%g kHz" % (f["bw_hz"] / 1e3)
     else:
         bw = "~%d kHz" % round(f["width_hz"] / 1e3)
     more = ">" if f["cut_off"] else ""
@@ -277,6 +279,10 @@ def run_watch(sdr, args, region, reporter):
     it is measured whole."""
     centre = parse_freq(args.center)
     sdr.center_freq = centre
+    if args.preset:
+        p = args.preset
+        print("%s US default: %s, %s kHz, SF%d."
+              % (p.name, fmt_freq(p.freq_hz), "%g" % (p.bw_hz / 1e3), p.sf))
     seg = int(SEGMENT_S * SAMPLE_RATE)
     print("Watching %s-%s (centre %s); Ctrl-C stops."
           % (fmt_freq(centre - USABLE_HZ), fmt_freq(centre + USABLE_HZ),
@@ -374,7 +380,7 @@ def cmd_list_channels(args):
     for plan in region.plans:
         last = plan.first_number + plan.count - 1
         print("%-18s %-8s %-9s %-28s %s" % (
-            plan.name, "%d kHz" % (plan.bw_hz / 1e3),
+            plan.name, "%g kHz" % (plan.bw_hz / 1e3),
             "%d-%d" % (plan.first_number, last),
             "%s - %s" % (fmt_freq(plan.centre(plan.first_number)),
                          fmt_freq(plan.centre(last))),
@@ -382,6 +388,12 @@ def cmd_list_channels(args):
         for number, name in sorted(plan.named.items()):
             print("    %d = %s, %s" % (number, name,
                                        fmt_freq(plan.centre(number))))
+    if region.presets:
+        print()
+        print("Mesh defaults (watch with --<key>):")
+        for key, p in region.presets.items():
+            print("  --%-11s %-20s %s, %g kHz, SF%d" % (
+                key, p.name, fmt_freq(p.freq_hz), p.bw_hz / 1e3, p.sf))
 
 
 def build_parser():
@@ -397,6 +409,13 @@ def build_parser():
     parser.add_argument("--center",
                         help="watch one window centred here (e.g. 904.6M) "
                              "instead of sweeping")
+    nets = parser.add_mutually_exclusive_group()
+    nets.add_argument("--meshtastic", action="store_true",
+                      help="watch Meshtastic's default channel (US: "
+                           "LongFast, 906.875 MHz)")
+    nets.add_argument("--meshcore", action="store_true",
+                      help="watch MeshCore's default channel (US: "
+                           "910.525 MHz)")
     parser.add_argument("--duration", type=float, default=0,
                         help="with --center: stop after this many seconds "
                              "(default: until Ctrl-C)")
@@ -422,8 +441,27 @@ def build_parser():
     return parser
 
 
+def apply_preset(args, parser):
+    """--meshtastic / --meshcore: watch centred on the region's default
+    channel for that network."""
+    args.preset = None
+    chosen = [k for k in ("meshtastic", "meshcore") if getattr(args, k)]
+    if not chosen:
+        return
+    if args.center:
+        parser.error("--%s and --center can't be used together" % chosen[0])
+    region = loraregions.REGIONS[args.region]
+    preset = region.presets.get(chosen[0])
+    if preset is None:
+        parser.error("region %s has no %s default" % (region.code, chosen[0]))
+    args.preset = preset
+    args.center = "%.0f" % preset.freq_hz
+
+
 def main(argv=None):
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    apply_preset(args, parser)
     if args.list_channels:
         cmd_list_channels(args)
     else:
