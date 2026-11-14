@@ -46,7 +46,9 @@ from datetime import datetime, timezone
 import numpy as np
 
 import lora
+import lorademod
 import loraregions
+import meshtastic
 from cwscan import fmt_freq, open_sdr, parse_freq
 from hamscan import TUNERS, tuner_name
 
@@ -59,7 +61,10 @@ READ_BLOCK = 262144                 # samples per USB transfer (multiple of 256)
 SETTLE_S = 0.05                     # discarded after tuning.
 SEGMENT_S = 2.0                     # watch mode analyses this much at a time.
 MAX_CARRY_S = 4.0                   # longest packet carried across segments.
-SAVE_MARGIN_S = 0.005               # extra samples saved each side of a packet.
+LEAD_S = 0.005                      # samples kept before a packet ...
+TAIL_SYMBOLS = 20                   # ... and after its detected end (plus a
+TAIL_FRACTION = 0.25                # quarter of its length): the detector
+                                    # can end a packet early.
 DEFAULT_DWELL_S = 2.0
 
 
@@ -129,13 +134,68 @@ HEADER = "%-10s  %-12s  %-8s %-5s %-9s %-9s %-7s %9s  %-10s %s" % (
     "SNR", "Dwell", "Channel")
 
 
-def to_jsonable(facts):
-    out = {}
-    for key, value in facts.items():
-        if isinstance(value, np.generic):
-            value = value.item()
-        out[key] = value
-    return out
+def packet_span(facts, n_samples, sample_rate=SAMPLE_RATE):
+    """(first, stop) samples to keep for decoding or saving a packet."""
+    tail = TAIL_FRACTION * facts["duration_s"]
+    if facts.get("symbol_s"):
+        tail += TAIL_SYMBOLS * facts["symbol_s"]
+    a = max(0, facts["start"] - int(LEAD_S * sample_rate))
+    b = min(n_samples, facts["stop"] + int(tail * sample_rate))
+    return a, b
+
+
+def decode_packet(facts, iq, channels=(), sample_rate=SAMPLE_RATE):
+    """Demodulate a LoRa packet, and read it as Meshtastic when its sync
+    word says so. Adds facts["decoded"] (lorademod.decode()'s dict) and
+    facts["meshtastic"] (meshtastic.decode()'s, or None)."""
+    a, b = packet_span(facts, len(iq), sample_rate)
+    result = lorademod.decode(iq[a:b], sample_rate, facts["offset_hz"],
+                              facts["bw_hz"], facts["sf"],
+                              inverted=facts["chirp"] == "down")
+    facts["decoded"] = result
+    facts["meshtastic"] = None
+    if result["ok"] and result["sync_word"] == 0x2B:
+        facts["meshtastic"] = meshtastic.decode(result["payload"], channels)
+    return facts
+
+
+def fmt_decoded(facts, width=32):
+    """The indented lines printed under a decoded packet."""
+    d = facts.get("decoded")
+    if not d:
+        return []
+    pad = " " * 12
+    if not d["ok"] and d["length"] is None:
+        return [pad + "LoRa: not decoded (%s)" % d["error"]]
+    sync = "?" if d["sync_word"] is None else "0x%02X" % d["sync_word"]
+    name = lorademod.SYNC_WORDS.get(d["sync_word"])
+    crc = {True: "CRC ok", False: "CRC FAILED", None: "no CRC"}[d["crc_ok"]]
+    if d["error"] and d["crc_ok"] is not False:
+        crc = d["error"]
+    lines = [pad + "LoRa: sync %s%s, CR 4/%d, %d bytes, %s" % (
+        sync, " (%s)" % name if name else "", 4 + d["cr"], d["length"], crc)]
+    m = facts.get("meshtastic")
+    if m:
+        lines.append(pad + "Meshtastic: " + meshtastic.summary(m))
+    elif d["payload"]:
+        hexed = d["payload"][:width].hex()
+        more = "..." if len(d["payload"]) > width else ""
+        lines.append(pad + "payload: %s%s" % (hexed, more))
+    return lines
+
+
+def to_jsonable(value):
+    """Facts -> something json.dump takes: numpy scalars to Python, bytes
+    to hex, recursively."""
+    if isinstance(value, dict):
+        return {k: to_jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [to_jsonable(v) for v in value]
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value).hex()
+    return value
 
 
 def save_iq(directory, iq, facts, sample_rate):
@@ -146,9 +206,7 @@ def save_iq(directory, iq, facts, sample_rate):
         "%Y%m%dT%H%M%S.%f")[:-3]
     base = os.path.join(directory, "lora_%sZ_%.4fMHz" % (stamp,
                                                          facts["freq_hz"] / 1e6))
-    margin = int(SAVE_MARGIN_S * sample_rate)
-    a = max(0, facts["start"] - margin)
-    b = min(len(iq), facts["stop"] + margin)
+    a, b = packet_span(facts, len(iq), sample_rate)
     t = np.arange(a, b) / sample_rate
     piece = (iq[a:b] * np.exp(-2j * np.pi * facts["offset_hz"] * t))
     np.save(base + ".npy", piece.astype(np.complex64))
@@ -226,6 +284,7 @@ class Reporter:
         self.region = region
         self.lora = 0
         self.hidden = 0
+        self.decoded = 0
         self.printed_header = False
 
     def report(self, facts, iq):
@@ -236,15 +295,20 @@ class Reporter:
             print(HEADER)
             self.printed_header = True
         self.lora += facts["is_lora"]
+        if facts["is_lora"] and self.args.decode:
+            decode_packet(facts, iq, self.args.channels)
+            self.decoded += facts["decoded"]["ok"]
         line = fmt_row(facts)
         if self.args.save_iq and facts["is_lora"]:
             path = save_iq(self.args.save_iq, iq, facts, SAMPLE_RATE)
             line += "  [%s]" % os.path.basename(path)
-        print(line, flush=True)
+        print("\n".join([line] + fmt_decoded(facts)), flush=True)
 
     def summary(self):
         print()
-        print("%d LoRa transmission(s) found." % self.lora)
+        print("%d LoRa transmission(s) found%s." % (
+            self.lora, ", %d decoded" % self.decoded if self.args.decode
+            else ""))
         if self.hidden:
             print("%d other wideband burst(s) (no LoRa chirps) hidden; "
                   "--all lists them." % self.hidden)
@@ -396,6 +460,31 @@ def cmd_list_channels(args):
                 key, p.name, fmt_freq(p.freq_hz), p.bw_hz / 1e3, p.sf))
 
 
+def cmd_decode_files(args):
+    """Decode packets saved by --save-iq (each .npy with its .json)."""
+    failed = 0
+    for path in args.decode_file:
+        base = path[:-4] if path.endswith((".npy", ".json")) else path
+        try:
+            with open(base + ".json") as fh:
+                facts = json.load(fh)
+            iq = np.load(base + ".npy")
+        except (OSError, ValueError) as exc:
+            print("%s: can't read (%s)" % (path, exc))
+            failed += 1
+            continue
+        # The saved samples are already at 0 Hz and start at first_sample.
+        rate = facts["sample_rate"]
+        facts.update(offset_hz=0.0, start=facts["start"] - facts["first_sample"],
+                     stop=facts["stop"] - facts["first_sample"])
+        decode_packet(facts, iq, args.channels, rate)
+        print("%s  %s" % (os.path.basename(base), fmt_row(facts)))
+        for line in fmt_decoded(facts):
+            print(line)
+        failed += not facts["decoded"]["ok"]
+    return 1 if failed else 0
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="lorascan.py",
@@ -432,6 +521,15 @@ def build_parser():
                              "125 kHz x 4 ms box (default %(default)s)")
     parser.add_argument("--all", action="store_true",
                         help="also list wideband bursts that aren't LoRa")
+    parser.add_argument("--no-decode", dest="decode", action="store_false",
+                        help="list packets without demodulating them")
+    parser.add_argument("--psk", action="append", default=[],
+                        metavar="[NAME:]BASE64",
+                        help="extra Meshtastic channel key to try (as shown "
+                             "in the app, e.g. MyChan:abc...=); repeatable. "
+                             "The default key is always tried")
+    parser.add_argument("--decode-file", nargs="+", metavar="NPY",
+                        help="decode packets saved with --save-iq, then exit")
     parser.add_argument("--save-iq", metavar="DIR",
                         help="save each LoRa packet's samples and facts here")
     parser.add_argument("--gain", default="auto",
@@ -462,8 +560,14 @@ def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
     apply_preset(args, parser)
+    try:
+        args.channels = [meshtastic.parse_psk(p) for p in args.psk]
+    except (ValueError, TypeError) as exc:
+        parser.error("bad --psk: %s" % exc)
     if args.list_channels:
         cmd_list_channels(args)
+    elif args.decode_file:
+        return cmd_decode_files(args)
     else:
         cmd_scan(args)
     return 0

@@ -23,7 +23,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import numpy as np
 
 import lora
+import lorademod
 import lorascan
+import meshtastic
 from loraregions import US915
 
 FS = lora.SAMPLE_RATE
@@ -350,6 +352,95 @@ def test_fact_row():
         assert text in row, (text, row)
 
 
+def test_whitening_and_crc():
+    """LoRa whitening starts FF FE FC F8 F0 E1 C2 85 0B 17 2F 5E; CRC-16
+    is CCITT with init 0 (check value of '123456789' is 0x31C3)."""
+    assert lorademod.WHITENING[:12].hex() == "fffefcf8f0e1c2850b172f5e"
+    assert lorademod.crc16(b"123456789") == 0x31C3
+
+
+def test_hamming_and_interleave():
+    """Every nibble survives Hamming at each CR, CR 4/7 and 4/8 fix any
+    one flipped bit, and interleaving round-trips."""
+    for cr in range(1, 5):
+        for nib in range(16):
+            assert lorademod.hamming_decode(
+                lorademod.hamming_encode(nib, cr), cr)[0] == nib
+    for cr in (3, 4):
+        for nib in range(16):
+            cw = lorademod.hamming_encode(nib, cr)
+            for bit in range(4 + cr):
+                assert lorademod.hamming_decode(cw ^ (1 << bit), cr)[0] == nib
+    rng = np.random.default_rng(0)
+    for sf_app, cw_len in ((7, 5), (10, 8), (5, 8)):
+        cws = list(rng.integers(0, 2 ** cw_len, sf_app))
+        values = lorademod.interleave(cws, sf_app, cw_len, False)
+        assert lorademod.deinterleave(values, sf_app, cw_len) == cws
+
+
+def lora_packet(payload, sf, bw, cr=1, sync=0x12, invert=False,
+                offset_hz=250e3, snr_db=10, preamble=8, seed=0):
+    """A whole encoded packet in noise, starting 5 ms in."""
+    syms = lorademod.encode(payload, sf, cr, True, lorademod.use_ldro(sf, bw))
+    sig = lorademod.modulate(syms, sf, bw, FS, sync_word=sync,
+                             preamble=preamble, offset_hz=offset_hz,
+                             invert=invert)
+    iq = noise(len(sig) / FS + 0.05, seed=seed)
+    return add(iq, sig, 0.005, snr_db, bw)
+
+
+def test_decode_round_trip():
+    """Payloads come back byte for byte across SF, bandwidth, coding
+    rate, I/Q inversion, LDRO and frequency offset, at 0 dB SNR."""
+    rng = np.random.default_rng(1)
+    cases = [(7, 125_000, 1, False), (9, 125_000, 4, False),
+             (8, 500_000, 3, True), (11, 250_000, 2, False),
+             (11, 125_000, 1, False),  # LDRO
+             (7, 62_500, 1, False)]
+    for sf, bw, cr, inv in cases:
+        payload = bytes(rng.integers(0, 256, 30).tolist())
+        iq = lora_packet(payload, sf, bw, cr, sync=0x34, invert=inv,
+                         offset_hz=250e3 + 3e3, snr_db=0, seed=sf)
+        r = lorademod.decode(iq, FS, 250e3, bw, sf, inverted=inv)
+        assert r["ok"] and r["payload"] == payload, (sf, bw, cr, inv, r)
+        assert r["sync_word"] == 0x34 and r["cr"] == cr, r
+        assert abs(r["cfo_hz"] - 3e3) < bw / 2 ** sf, r
+
+
+def test_meshtastic_over_lora():
+    """A LongFast text message, sent as LoRa (sync word 0x2B), is found,
+    demodulated, decrypted and printed by lorascan."""
+    pkt = meshtastic.encode(meshtastic.BROADCAST, 0xDEADBEEF, 0x01020304, 1,
+                            b"hi from the test")
+    iq = lora_packet(pkt, 11, 250_000, cr=1, sync=0x2B, preamble=16,
+                     snr_db=6)
+    (burst,) = [b for b in lora.analyse(iq) if b["is_lora"]]
+    facts = lorascan.describe(burst, 906.625e6, 0.0, US915)
+    lorascan.decode_packet(facts, iq)
+    lines = "\n".join(lorascan.fmt_decoded(facts))
+    for text in ("sync 0x2B (Meshtastic)", "CRC ok", "!deadbeef -> ^all",
+                 "[LongFast]", 'TEXT_MESSAGE: "hi from the test"'):
+        assert text in lines, (text, lines)
+    assert facts["channels"][0].startswith("Meshtastic slot 20"), facts
+
+
+def test_decode_saved_file():
+    """A packet saved with --save-iq decodes again with --decode-file."""
+    payload = b"saved for later"
+    iq = lora_packet(payload, 8, 125_000, cr=2, seed=4)
+    (burst,) = [b for b in lora.analyse(iq) if b["is_lora"]]
+    facts = lorascan.describe(burst, 915e6, 1_700_000_000.0, US915)
+    with tempfile.TemporaryDirectory() as tmp:
+        path = lorascan.save_iq(tmp, iq, facts, FS)
+        args = lorascan.build_parser().parse_args(["--decode-file", path])
+        args.channels = []
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            status = lorascan.cmd_decode_files(args)
+    assert status == 0, out.getvalue()
+    assert "CRC ok" in out.getvalue() and payload.hex()[:20] in out.getvalue()
+
+
 TESTS = [
     ("chirp generator", test_chirp_reference),
     ("SF7-12 at every bandwidth", test_every_sf_and_bw),
@@ -368,6 +459,11 @@ TESTS = [
     ("watch carries packets across segments", test_watch_carry_over),
     ("--save-iq round trip", test_save_iq),
     ("fact row", test_fact_row),
+    ("whitening and CRC", test_whitening_and_crc),
+    ("Hamming and interleaving", test_hamming_and_interleave),
+    ("decode round trip at 0 dB", test_decode_round_trip),
+    ("Meshtastic message over LoRa", test_meshtastic_over_lora),
+    ("--decode-file", test_decode_saved_file),
 ]
 
 

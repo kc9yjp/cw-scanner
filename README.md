@@ -24,7 +24,10 @@ logging) that a general scanner doesn't bother with.
   (US rules for now) and lists each one's facts: time, frequency,
   bandwidth, spreading factor, chirp direction, airtime, SNR, whether it
   keeps to the FCC dwell limit, and the LoRaWAN or Meshtastic channel it
-  is on. It doesn't decode the payload yet.
+  is on. It then decodes each packet (header, payload, CRC) and reads
+  Meshtastic packets: sender, destination, hops, channel, and, on the
+  default channel, the message itself (text, position, node info,
+  telemetry).
 
 ## Install (Arch)
 
@@ -146,16 +149,24 @@ python3 lorascan.py --center 904.6M
 python3 lorascan.py --meshtastic --duration 600
 python3 lorascan.py --meshcore --duration 600
 
-# Save each packet's samples for decoding later
+# Read a private Meshtastic channel too (key as shown in the app)
+python3 lorascan.py --meshtastic --psk "MyChannel:base64key="
+
+# Save each packet's samples, and decode saved ones later
 python3 lorascan.py --center 904.6M --save-iq captures/
+python3 lorascan.py --decode-file captures/*.npy
 ```
 
 Example output (from the synthetic self-test):
 
 ```
 Time UTC    Frequency     BW       SF    Chirps    Airtime   Symbols       SNR  Dwell      Channel
-14:02:11.2  904.3000 MHz  125 kHz  SF9   up        172 ms    42        +5.5 dB  ok         LoRaWAN uplink 10 (sub-band 2) / Meshtastic slot 19
-14:02:15.0  923.2984 MHz  500 kHz  SF8   down/inv  21 ms     42        +2.9 dB  n/a        LoRaWAN downlink 0
+14:02:11.1  906.8758 MHz  250 kHz  SF11  up        559 ms    68        +5.3 dB  over limit Meshtastic slot 20 (LongFast default)
+            LoRa: sync 0x2B (Meshtastic), CR 4/5, 39 bytes, CRC ok
+            Meshtastic: !deadbeef -> ^all  id 01020304  hops 3/3  [LongFast]  TEXT_MESSAGE: "hello from the test"
+14:02:20.0  907.0008 MHz  500 kHz  SF8   up        44 ms     86        +4.9 dB  n/a        -
+            LoRa: sync 0x12 (private), CR 4/6, 40 bytes, CRC ok
+            payload: 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f...
 ```
 
 - **BW / SF** — the occupied bandwidth (62.5, 125, 250 or 500 kHz) is measured
@@ -174,6 +185,17 @@ Time UTC    Frequency     BW       SF    Chirps    Airtime   Symbols       SNR  
 - **Channel** — every channel plan the frequency fits. The grids
   overlap: Meshtastic's 125 kHz slots sit 12.5 kHz from many LoRaWAN
   uplinks, so some packets match both.
+
+**Decoding.** Under each packet, the `LoRa:` line gives its sync word
+(0x34 LoRaWAN, 0x12 private, 0x2B Meshtastic), coding rate, length and
+whether the payload CRC checked out; `payload:` shows its first bytes.
+Packets with the Meshtastic sync word get a `Meshtastic:` line: sender
+and destination node, packet id, hops left of hops allowed, the channel,
+and what the packet holds. Traffic on any preset channel with the
+default key (LongFast included) is readable by every Meshtastic node, so
+it is decoded here too. Other channels need their key (`--psk`), and
+direct messages encrypted to a node's public key can't be read at all;
+both are labelled. `--no-decode` skips decoding.
 
 Only LoRa is listed. The band is full of other short bursts (smart
 meters and other frequency hoppers, mostly 60-90 kHz FSK); `--all` lists
@@ -244,15 +266,24 @@ most dongles.
 - `lorascan.py` — the LoRa scanner: tuning, sweep and watch modes, the
   fact table, `--save-iq`.
 - `lora.py` — LoRa DSP with no hardware: burst detection, bandwidth
-  measurement, SF and chirp direction by dechirping. This is where a
-  decoder will go.
-- `loraregions.py` — LoRa rules and channel plans per region (US915).
-- `test_synth.py`, `test_hamscan.py`, `test_lora.py` — self-tests with
-  synthetic signals. Run them any time:
+  measurement, SF and chirp direction by dechirping.
+- `lorademod.py` — the LoRa physical layer: synchronisation, demodulation,
+  Gray mapping, deinterleaving, Hamming, de-whitening, header and CRC
+  (after the open-source gr-lora_sdr receiver), plus an encoder for
+  tests.
+- `meshtastic.py` — Meshtastic packets: header, channel hash, AES-CTR
+  decryption and the protobuf messages inside.
+- `aes.py` — a small pure-Python AES (so no crypto library is needed).
+- `loraregions.py` — LoRa rules, channel plans and mesh defaults per
+  region (US915).
+- `test_synth.py`, `test_hamscan.py`, `test_lora.py`,
+  `test_meshtastic.py` — self-tests with synthetic signals and published
+  test vectors. Run them any time:
   ```sh
   python3 test_synth.py
   python3 test_hamscan.py
   python3 test_lora.py
+  python3 test_meshtastic.py
   ```
 
 ## Status
@@ -276,7 +307,7 @@ yet against signals of known mode off the air.
 `lorascan.py` is checked on synthetic packets (every SF at 125 kHz, plus
 250 and 500 kHz, inverted I/Q, -4 dB SNR, two channels at once, and FSK
 and too-short chirp bursts that must not count) and on a fake dongle for
-the sweep and the gapless watch stream (17 tests). On the R820T dongle it
+the sweep and the gapless watch stream. On the R820T dongle it
 has swept the whole band and watched sub-band 2, the Meshtastic LongFast
 channel and the MeshCore channel. A first version called a few short FSK bursts LoRa; the
 chirp threshold was set from ~70 real off-air bursts (the highest scored
@@ -286,12 +317,23 @@ packets (SF11, 250 kHz, about 600 ms, +40 dB from a nearby node) and
 named the channel correctly. Nothing was heard on the MeshCore channel
 during the test.
 
+Decoding is checked on synthetic packets (SF7-12, every bandwidth and
+coding rate, inverted I/Q, LDRO, frequency offsets, down to 0 dB in the
+tests; SF11-12 decode at -10 dB), against published AES test vectors,
+and off the air. On the R820T, 20 of 23 real packets decoded with a good
+CRC: Meshtastic LongFast packets from a nearby node (position, node
+info, a text message, and copies relayed by a second node), and a
+private-sync-word device near 906.96 MHz sending 101-byte packets at
+SF8/500 kHz. The failures were two packets saved before `--save-iq` kept
+enough samples past the end, and one weak burst at 906.16 MHz with no
+preamble found (that frequency keeps producing chirp-like bursts that
+don't decode).
+
 ## What's next
 
-- **LoRa decoding** — use the samples saved with `--save-iq` to find the
-  sync word (LoRaWAN or private/Meshtastic), then demodulate, de-whiten
-  and decode the header and payload. LoRaWAN headers (device address,
-  frame counter) and Meshtastic headers are readable without keys.
+- **MeshCore and LoRaWAN** — read MeshCore packets (header, path,
+  advert names) and LoRaWAN frame headers (message type, device
+  address, frame counter), which need no keys.
 
 - **Web UI** — run the scanner on a Linux box and listen/control it from a
   phone browser, the way MultiScan's web control works.
