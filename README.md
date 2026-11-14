@@ -28,6 +28,9 @@ logging) that a general scanner doesn't bother with.
   Meshtastic packets: sender, destination, hops, channel, and, on the
   default channel, the message itself (text, position, node info,
   telemetry).
+- **`adsb-map.sh`** — a live map of aircraft (ADS-B, 1090 MHz) in the
+  browser, using the dump1090 decoder. `sdr-setup.sh` installs it along
+  with SDRangel and other decoders (HD Radio, digital voice, APRS/pager).
 
 ## Install (Arch)
 
@@ -39,6 +42,24 @@ source .venv/bin/activate
 This installs `rtl-sdr`, numpy and scipy with pacman, puts pyrtlsdr in a
 `.venv` virtualenv (it isn't in the official repos), checks the dongle
 setup and runs the self-test. It's safe to run again.
+
+### Optional: SDRangel and other decoders
+
+`sdr-setup.sh` installs tools from outside this project: SDRangel (a
+general-purpose SDR receiver with a GUI), dump1090 (ADS-B, needed by
+`adsb-map.sh`), nrsc5 (HD Radio), dsd-fme (DMR, D-STAR, YSF, P25 and NXDN
+digital voice) and multimon-ng (APRS, POCSAG pagers and more). It builds
+the AUR packages itself, in `~/.cache/sdr-build`; the Qt builds take a
+while. The scanners in this repo don't need any of it.
+
+```sh
+./sdr-setup.sh install            # repo deps, DVB driver blacklist, AUR builds
+./sdr-setup.sh status
+./sdr-setup.sh uninstall [--all]  # --all also removes rtl-sdr, multimon-ng and the build cache
+```
+
+Only one program can use the dongle at a time: close SDRangel before
+running a scanner or `adsb-map.sh`, and the other way round.
 
 ## Install (Debian / Ubuntu)
 
@@ -128,6 +149,22 @@ automatically on an R828D (V4); see the HF notes below. Microwave bands
 (13 cm and up) are beyond any RTL-SDR without a downconverter. 9 cm
 (3.3-3.5 GHz) is left out because the FCC voted in 2020 to remove that
 allocation.
+
+### Aircraft map (ADS-B)
+
+```sh
+./adsb-map.sh                                  # map on http://localhost:8080
+./adsb-map.sh --lat 41.95 --lon -87.80         # your position: site marker,
+                                               # range rings, better decoding
+./adsb-map.sh --adaptive --gain 40             # adapt gain to the noise floor
+./adsb-map.sh -- --ppm 54                      # after --: straight to dump1090
+```
+
+It runs dump1090 and serves its SkyAware map locally (raw feeds on ports
+30002, 30003 and 30005 too), and prints the aircraft count, noise and
+signal levels every 5 seconds. Ctrl-C stops everything. Without `--lat`
+and `--lon` the map is centred on Chicago. 1090 MHz is line of sight:
+an antenna up high with a clear view does far more than gain settings.
 
 ### LoRa scanner
 
@@ -256,6 +293,10 @@ most dongles.
 
 ## Files
 
+- `install-arch.sh` — installs what the scanners need (see Install).
+- `sdr-setup.sh` — optional: SDRangel, dump1090, nrsc5, dsd-fme and
+  multimon-ng.
+- `adsb-map.sh` — live ADS-B aircraft map (dump1090 + SkyAware).
 - `cwscan.py` — the CLI tool (`scan` / `listen`). All DSP is pure
   numpy/scipy; only the dongle code needs pyrtlsdr.
 - `morse.py` — Morse encoder and a simple mark/space timing decoder.
@@ -328,6 +369,11 @@ SF8/500 kHz. The failures were two packets saved before `--save-iq` kept
 enough samples past the end, and one weak burst at 906.16 MHz with no
 preamble found (that frequency keeps producing chirp-like bursts that
 don't decode).
+
+`adsb-map.sh` and `sdr-setup.sh` came from a separate setup repo, where
+they had been used on this dongle. Here, `adsb-map.sh` was run briefly
+indoors: dump1090, the web map and shutdown all work, but no aircraft
+were heard in that 25 s.
 
 ## What's next
 
